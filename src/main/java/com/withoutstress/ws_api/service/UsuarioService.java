@@ -1,0 +1,315 @@
+package com.withoutstress.ws_api.service;
+
+import com.withoutstress.ws_api.common.UsuarioValidator;
+import com.withoutstress.ws_api.converters.UsuarioConverter;
+import com.withoutstress.ws_api.dto.LoginRequest;
+import com.withoutstress.ws_api.dto.LoginResponse;
+import com.withoutstress.ws_api.dto.UsuarioRequest;
+import com.withoutstress.ws_api.dto.UsuarioToFollowResponse;
+import com.withoutstress.ws_api.entities.*;
+import com.withoutstress.ws_api.exception.BadResourceRequestException;
+import com.withoutstress.ws_api.exception.GeneralServiceException;
+import com.withoutstress.ws_api.exception.ResourceNotFoundException;
+import com.withoutstress.ws_api.repository.*;
+import com.withoutstress.ws_api.repository.ActividadRepository;
+import com.withoutstress.ws_api.repository.RecompensaRepository;
+import com.withoutstress.ws_api.repository.UsuarioRepository;
+import com.withoutstress.ws_api.security.UserPrincipal;
+
+import com.withoutstress.ws_api.entities.Actividad;
+import com.withoutstress.ws_api.entities.Recompensa;
+import com.withoutstress.ws_api.entities.Usuario;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import io.jsonwebtoken.*;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.Date;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+
+@Slf4j
+@Service
+public class UsuarioService {
+
+    @Value("${jwt.password}")
+    private String jwtSecret;
+
+    @Autowired
+    private UsuarioRepository usuarioRepository;
+
+    @Autowired
+    private RecompensaRepository recompensaRepository;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private UsuarioConverter usuarioConverter;
+
+    @Autowired
+    private ActividadRepository actividadRepository;
+
+    @Transactional(isolation = Isolation.READ_COMMITTED, propagation = Propagation.REQUIRED)
+    public Usuario createUser(UsuarioRequest usuarioRequest) {
+        
+        try {
+            Usuario user = initUsuario(usuarioRequest);
+            UsuarioValidator.validateUser(usuarioRequest);
+            Usuario existUser=usuarioRepository.findByCorreo(user.getCorreo())
+                    .orElse(null);
+            if(existUser!=null)
+                throw new BadResourceRequestException("Ya se registro una cuenta con este correo.");
+
+            String encoder = passwordEncoder.encode(user.getPassword());
+            user.setPassword(encoder);
+
+            return usuarioRepository.save(user);
+        } catch (BadResourceRequestException | ResourceNotFoundException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new GeneralServiceException(e.getMessage(), e);
+        }
+    }
+
+    @Transactional(readOnly = true)
+    public List<Usuario> findAllUsers() {
+        List<Usuario> usuarios = usuarioRepository.findAll();
+        return usuarios;
+    }
+
+    @Transactional(readOnly = true)
+    public List<UsuarioToFollowResponse> findAllUsersToFollow() {
+        Usuario usuario = UserPrincipal.getCurrentUser();
+        
+        String correo = usuario.getCorreo();
+
+        List<Usuario> usuarios = usuarioRepository.findAll();
+        usuarios = Arrays.asList(usuarios.stream().filter(
+            o -> {
+                System.out.println(o.getCorreo());
+                return o.getCorreo().compareTo(correo) != 0;
+            }
+        ).toArray(Usuario[]::new));
+
+        List<UsuarioToFollowResponse> usuariosToFollow = Arrays.asList(
+            usuarios.stream().map(
+                o -> usuarioConverter.fromContact(o, 
+                    usuario.getContactos().stream().filter( u -> 
+                        u.getCorreo().compareTo(o.getCorreo()) == 0
+                    ).findFirst().orElse(null) != null
+                )
+            ).toArray(UsuarioToFollowResponse[]::new)
+        );
+
+        return usuariosToFollow;
+    }
+
+    @Transactional(readOnly = true)
+    public Usuario findUsuarioById(Long userId) {
+        Optional<Usuario> usuario = Optional.ofNullable(usuarioRepository.findUsuarioById(userId));
+        return usuario.orElseThrow(() -> ResourceNotFoundException.byIndex("Usuario", userId) );
+    }
+
+    @Transactional(readOnly = true)
+    public List<Usuario> finUsuarioByNombresAndApellidos(String nombres, String apellidos) {
+        Optional<List<Usuario>> usuarios = Optional.ofNullable(usuarioRepository.finUsuarioByNombresAndApellidos(nombres, apellidos));
+        return usuarios.orElseThrow(() -> new ResourceNotFoundException("No se encontro al usuario con nombre "+ nombres));
+    }
+
+    @Transactional(readOnly = true)
+    public Usuario finUsuarioByCorreoAndPassword(String correo, String password) {
+        Optional<Usuario> usuario = Optional.ofNullable(usuarioRepository.findUsuarioByCorreoAndPassword(correo, password));
+        return usuario.orElseThrow(() -> new ResourceNotFoundException("El correro la contraseña estan mal"));
+    }
+    @Transactional(readOnly = true)
+    public Usuario findUsuario() {
+        Usuario usuario = UserPrincipal.getCurrentUser();
+        return usuario;
+    }
+
+    @Transactional(readOnly = true)
+    public List<Usuario> getContactos(){
+
+        Usuario usuario = UserPrincipal.getCurrentUser();
+        
+        return usuario.getContactos();
+    }
+
+    @Transactional
+    public Boolean followToUser(Long followedId) {
+
+        Usuario usuario = UserPrincipal.getCurrentUser();
+
+        UsuarioValidator.validateFollow(usuario.getId(), followedId);
+        Usuario followed = usuarioRepository.findById(followedId).
+            orElseThrow(() -> ResourceNotFoundException.byIndex("Usuario", followedId) );
+
+        Usuario followedf = usuario.getContactos().stream().filter( u -> u.getCorreo().compareTo(followed.getCorreo()) == 0 ).findFirst().orElse(null);
+
+        if(followedf != null)
+            usuario.getContactos().remove(followedf);
+        else
+            usuario.getContactos().add(followed);
+    
+        usuarioRepository.save(usuario);
+        return followedf == null;
+    }
+
+    @Transactional
+    public Boolean get_cancel_Premium() {
+        Usuario usuario = UserPrincipal.getCurrentUser();
+
+        if (usuario.getIsPremium() != Boolean.TRUE) {
+            usuario.setIsPremium(Boolean.TRUE);
+            usuario.setNum_monedas(usuario.getNum_monedas() + 15000);
+        }
+        else
+            usuario.setIsPremium(Boolean.FALSE);
+
+        usuarioRepository.save(usuario);
+
+        return usuario.getIsPremium();
+    }
+
+    public Boolean buy_premium_with_coins(){
+        Usuario usuario = UserPrincipal.getCurrentUser();
+        if(usuario.getNum_monedas() >= 10000){
+            if (usuario.getIsPremium() != Boolean.TRUE) {
+                usuario.setIsPremium(Boolean.TRUE);
+                usuario.setNum_monedas(usuario.getNum_monedas() - 10000);
+            }
+            else
+                usuario.setIsPremium(Boolean.FALSE);
+        }
+        else
+            usuario.setIsPremium(Boolean.FALSE);
+
+        usuarioRepository.save(usuario);
+
+        return usuario.getIsPremium();
+    }
+
+    @Transactional
+    public Usuario updateUsuarioById(UsuarioRequest usuarioRequest) {
+        UsuarioValidator.validateUser(usuarioRequest);
+
+        Usuario usuario = UserPrincipal.getCurrentUser();
+
+        usuario.setNombres(usuarioRequest.getNombres());
+        usuario.setApellidos(usuarioRequest.getApellidos());
+        usuario.setCorreo(usuarioRequest.getCorreo());
+
+        String encoder = passwordEncoder.encode(usuarioRequest.getPassword());
+        usuario.setPassword(encoder);
+
+        usuario.setTipo_usuario(usuarioRequest.getTipo_usuario());
+        return usuarioRepository.save(usuario);
+    }
+
+    @Transactional
+    public void deleteUsuarioById(){
+        Usuario usuario = UserPrincipal.getCurrentUser();
+
+        usuario.getContactos().forEach((Usuario userFollow) -> {
+            userFollow.getContactos().remove(usuario);
+        });
+
+        usuario.getActividades().forEach((Actividad actividad) -> {
+           actividadRepository.delete(actividad);
+        });
+
+        usuario.getRecompensas().forEach((Recompensa recompensa) -> {
+            recompensaRepository.delete(recompensa);
+        });
+
+        usuarioRepository.deleteContactos(usuario.getId());
+        usuarioRepository.deleteGrupos(usuario.getId());
+        usuarioRepository.delete(usuario);
+    }
+
+    @Transactional(readOnly = true)
+    public List<Recompensa> findRecompensasByUserId() {
+        Usuario usuario = UserPrincipal.getCurrentUser();
+
+        Optional<List<Recompensa>> recompensas = Optional.ofNullable(recompensaRepository.findRecompensasByUserId(usuario.getId()));
+        return recompensas.orElseThrow(() -> ResourceNotFoundException.byIndex("Usuario", usuario.getId()) );
+    }
+
+    public LoginResponse login(LoginRequest request){
+        try {
+            Usuario user=usuarioRepository.findByCorreo(request.getCorreo())
+                    .orElseThrow(()->new BadResourceRequestException("Usuario o password incorrecto"));
+
+            if(!passwordEncoder.matches(request.getPassword(), user.getPassword()))
+                throw new BadResourceRequestException("Usuario o password incorrecto");
+
+            String token = createToken(user);
+
+            return new LoginResponse(usuarioConverter.fromEntity(user),token);
+
+        } catch (BadResourceRequestException | ResourceNotFoundException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new GeneralServiceException(e.getMessage(), e);
+        }
+    }
+
+    public String createToken(Usuario user){
+        Date now =new Date();
+        Date expiryDate=new Date(now.getTime()+ (1000*60*60*24));
+
+        return Jwts.builder()
+                .setSubject(user.getCorreo())
+                .setIssuedAt(now)
+                .setExpiration(expiryDate)
+                .signWith(SignatureAlgorithm.HS512, jwtSecret).compact();
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parser().setSigningKey(jwtSecret).parseClaimsJws(token);
+            return true;
+        }catch (UnsupportedJwtException e) {
+            log.error("JWT in a particular format/configuration that does not match the format expected");
+        }catch (MalformedJwtException e) {
+            log.error(" JWT was not correctly constructed and should be rejected");
+        }catch (SignatureException e) {
+            log.error("Signature or verifying an existing signature of a JWT failed");
+        }catch (ExpiredJwtException e) {
+            log.error("JWT was accepted after it expired and must be rejected");
+        }
+        return false;
+    }
+
+    public String getUsernameFromToken(String jwt) {
+        try {
+            return Jwts.parser().setSigningKey(jwtSecret).parseClaimsJws(jwt).getBody().getSubject();
+        } catch (Exception e) {
+            throw new BadResourceRequestException("Invalid Token");
+        }
+    }
+
+
+    private Usuario initUsuario(UsuarioRequest usuarioRequest) {
+        Usuario usuario = new Usuario();
+        usuario.setNombres(usuarioRequest.getNombres());
+        usuario.setApellidos(usuarioRequest.getApellidos());
+        usuario.setCorreo(usuarioRequest.getCorreo());
+        usuario.setPassword(usuarioRequest.getPassword());
+        usuario.setNum_act_completas(Integer.valueOf(0));
+        usuario.setNum_monedas(Integer.valueOf(0));
+        usuario.setIsPremium(Boolean.FALSE);
+        usuario.setTipo_usuario(usuarioRequest.getTipo_usuario());
+        usuario.setRecompensas(new ArrayList<Recompensa>());
+        usuario.setActividades(new ArrayList<Actividad>());
+        return usuario;
+    }
+}
